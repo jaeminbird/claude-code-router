@@ -1210,7 +1210,7 @@ class HttpMcpClient implements McpClient {
       if (!text.trim()) {
         return undefined;
       }
-      return parseHttpJsonRpcResponse(text);
+      return parseHttpJsonRpcResponse(text, request.id);
     } finally {
       clearTimeout(timer);
     }
@@ -1928,21 +1928,21 @@ function normalizeOptionalSchema(value: unknown): Record<string, unknown> | unde
   return isRecord(value) ? value : undefined;
 }
 
-function parseHttpJsonRpcResponse(text: string): unknown {
+function parseHttpJsonRpcResponse(text: string, id?: unknown): unknown {
   if (/^event:/m.test(text) || /^data:/m.test(text)) {
-    const events = text.split(/\n\n+/);
-    for (const event of events) {
-      const data = event
-        .split(/\n/)
-        .filter((line) => line.startsWith("data:"))
-        .map((line) => line.slice("data:".length).trim())
-        .join("\n");
-      if (!data) continue;
+    // The SSE reply can carry notifications or server requests before the
+    // response, so return the message that answers this request.
+    const messages: unknown[] = [];
+    consumeSseEvents(`${text}\n\n`, (event) => {
       try {
-        return JSON.parse(data) as unknown;
+        messages.push(JSON.parse(event.data) as unknown);
       } catch {
-        continue;
+        // Not a JSON-RPC message.
       }
+    });
+    const response = messages.find((message) => isRecord(message) && message.id === id && ("result" in message || "error" in message));
+    if (response !== undefined || messages.length > 0) {
+      return response ?? messages[0];
     }
   }
   return JSON.parse(text) as unknown;

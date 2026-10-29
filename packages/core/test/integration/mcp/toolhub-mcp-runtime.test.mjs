@@ -659,6 +659,87 @@ test("built ToolHub MCP runtime keeps resolve cache scoped by task", async (t) =
   assert.deepEqual(second.result.selectedToolNames, ["mcp.multi_mcp.campaign-calendar"]);
 });
 
+test("built ToolHub MCP runtime returns the tool result that follows a notification in an SSE reply", async (t) => {
+  const runtime = toolHubRuntimePath();
+  if (!existsSync(runtime)) {
+    t.skip("ToolHub MCP runtime has not been built.");
+    return;
+  }
+
+  const backend = createSseMcpHttpServer();
+  const resolver = createFixedResolverServer(["mcp.ssetools.echo"]);
+  try {
+    await listen(backend);
+    await listen(resolver);
+  } catch (error) {
+    backend.close();
+    resolver.close();
+    t.skip(`Local HTTP listen is unavailable: ${error.message}`);
+    return;
+  }
+  t.after(() => backend.close());
+  t.after(() => resolver.close());
+
+  const child = spawn(process.execPath, [runtime], {
+    env: {
+      ...process.env,
+      TOOLHUB_MCP_SERVERS_JSON: JSON.stringify([
+        {
+          name: "ssetools",
+          transport: "streamable-http",
+          url: `http://127.0.0.1:${backend.address().port}/mcp`
+        }
+      ]),
+      TOOLHUB_OPENAI_API_KEY: "test-key",
+      TOOLHUB_OPENAI_BASE_URL: `http://127.0.0.1:${resolver.address().port}/v1`,
+      TOOLHUB_OPENAI_MODEL: "resolver-model",
+      TOOLHUB_REQUEST_TIMEOUT_MS: "10000"
+    },
+    stdio: ["pipe", "pipe", "pipe"]
+  });
+  t.after(() => child.kill());
+
+  const stderr = [];
+  child.stderr.on("data", (chunk) => stderr.push(chunk.toString("utf8")));
+  const reader = jsonLineReader(child);
+  writeJsonLine(child, {
+    id: 1,
+    jsonrpc: "2.0",
+    method: "initialize",
+    params: {
+      capabilities: {},
+      clientInfo: { name: "sse-reply-test", version: "1.0.0" },
+      protocolVersion: "2024-11-05"
+    }
+  });
+  await reader.nextMessage(1);
+  writeJsonLine(child, { jsonrpc: "2.0", method: "notifications/initialized", params: {} });
+  writeJsonLine(child, {
+    id: 2,
+    jsonrpc: "2.0",
+    method: "tools/call",
+    params: { name: "tool_hub.resolve", arguments: { task: "Echo some text." } }
+  });
+  const resolved = await reader.nextMessage(2, 12_000).catch((error) => {
+    error.message += ` stderr: ${stderr.join("")}`;
+    throw error;
+  });
+  assert.deepEqual(resolved.result.selectedToolNames, ["mcp.ssetools.echo"]);
+
+  writeJsonLine(child, {
+    id: 3,
+    jsonrpc: "2.0",
+    method: "tools/call",
+    params: { name: "tool_hub.invoke", arguments: { args: { text: "hi" }, tool: "mcp.ssetools.echo" } }
+  });
+  const invoked = await reader.nextMessage(3, 12_000).catch((error) => {
+    error.message += ` stderr: ${stderr.join("")}`;
+    throw error;
+  });
+  assert.equal(invoked.error, undefined);
+  assert.deepEqual(invoked.result.content, [{ text: "echo: hi", type: "text" }]);
+});
+
 function toolHubRuntimePath() {
   return path.join(process.cwd(), ".test-dist", "core", "runtime", "toolhub-mcp.js");
 }
@@ -760,6 +841,48 @@ function createMcpHttpServer(options = {}) {
       return;
     }
     response.end(JSON.stringify({ id: payload.id, jsonrpc: "2.0", result: {} }));
+  });
+}
+
+// Replies the way the MCP TypeScript SDK's Streamable HTTP transport does by
+// default: one SSE stream per request, with a log notification sent before
+// the tools/call result.
+function createSseMcpHttpServer() {
+  return createServer(async (request, response) => {
+    const payload = await readJsonBody(request);
+    if (payload.id === undefined) {
+      response.statusCode = 202;
+      response.end();
+      return;
+    }
+    const events = [];
+    if (payload.method === "initialize") {
+      events.push({
+        id: payload.id,
+        jsonrpc: "2.0",
+        result: {
+          capabilities: { logging: {}, tools: {} },
+          protocolVersion: "2024-11-05",
+          serverInfo: { name: "ssetools", version: "1.0.0" }
+        }
+      });
+    } else if (payload.method === "tools/list") {
+      events.push({
+        id: payload.id,
+        jsonrpc: "2.0",
+        result: {
+          tools: [{ description: "Echo text back.", inputSchema: { type: "object" }, name: "echo" }]
+        }
+      });
+    } else {
+      events.push(
+        { jsonrpc: "2.0", method: "notifications/message", params: { data: "echoing", level: "info" } },
+        { id: payload.id, jsonrpc: "2.0", result: { content: [{ text: `echo: ${payload.params?.arguments?.text}`, type: "text" }] } }
+      );
+    }
+    response.setHeader("content-type", "text/event-stream");
+    response.setHeader("mcp-session-id", "sse-session");
+    response.end(events.map((event) => `event: message\ndata: ${JSON.stringify(event)}\n\n`).join(""));
   });
 }
 

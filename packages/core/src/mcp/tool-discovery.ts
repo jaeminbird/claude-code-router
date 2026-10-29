@@ -412,7 +412,8 @@ function parseJsonRpcMessageFromResponse(text: string, expectedId: JsonRpcMessag
   }
   if (trimmed.startsWith("event:") || trimmed.startsWith("data:")) {
     const messages: JsonRpcMessage[] = [];
-    consumeSseEvents(trimmed, (event) => {
+    // trim() removed the blank line that ends the last event; put it back.
+    consumeSseEvents(`${trimmed}\n\n`, (event) => {
       const message = parseJsonRpcMessage(event.data);
       if (message) {
         messages.push(message);
